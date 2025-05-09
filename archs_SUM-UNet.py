@@ -22,11 +22,115 @@ class DWConv(nn.Module):
         return x
 
 class shiftmlp(nn.Module):
-    #The core code will be provided after the paper is accepted.
+    def __init__(self, in_features,  act_layer=nn.GELU, drop=0., shift_size=5):
+        super().__init__()
+        out_features = in_features
+        hidden_features = in_features
+        self.dim = in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.dwconv = DWConv(hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+        self.shift_size = shift_size
+        self.pad = shift_size // 2
+
+        
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.Conv2d):
+            fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+            fan_out //= m.groups
+            m.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
+            if m.bias is not None:
+                m.bias.data.zero_()
+
+    def forward(self, x, H, W):
+        # pdb.set_trace()
+        B, N, C = x.shape
+
+        xn = x.transpose(1, 2).view(B, C, H, W).contiguous()
+        xn = F.pad(xn, (self.pad, self.pad, self.pad, self.pad) , "constant", 0)
+        xs = torch.chunk(xn, self.shift_size, 1)
+        x_shift = [torch.roll(x_c, shift, 2) for x_c, shift in zip(xs, range(-self.pad, self.pad+1))]
+        x_cat = torch.cat(x_shift, 1)
+        x_cat = torch.narrow(x_cat, 2, self.pad, H)
+        x_s = torch.narrow(x_cat, 3, self.pad, W)
+
+
+        x_s = x_s.reshape(B,C,H*W).contiguous()
+        x_shift_r = x_s.transpose(1,2)
+
+
+        x = self.fc1(x_shift_r)
+
+        x = self.dwconv(x, H, W)
+        x = self.act(x) 
+        x = self.drop(x)
+
+        xn = x.transpose(1, 2).view(B, C, H, W).contiguous()
+        xn = F.pad(xn, (self.pad, self.pad, self.pad, self.pad) , "constant", 0)
+        xs = torch.chunk(xn, self.shift_size, 1)
+        x_shift = [torch.roll(x_c, shift, 3) for x_c, shift in zip(xs, range(-self.pad, self.pad+1))]
+        x_cat = torch.cat(x_shift, 1)
+        x_cat = torch.narrow(x_cat, 2, self.pad, H)
+        x_s = torch.narrow(x_cat, 3, self.pad, W)
+        x_s = x_s.reshape(B,C,H*W).contiguous()
+        x_shift_c = x_s.transpose(1,2)
+
+        x = self.fc2(x_shift_c)
+        x = self.drop(x)
+        return x
 
 
 class PVMLayer(nn.Module):
-    #The core code will be provided after the paper is accepted.
+    def __init__(self, input_dim, output_dim, d_state = 16, d_conv = 4, expand = 2):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.norm = nn.LayerNorm(input_dim)
+        self.mamba = Mamba(
+                d_model=input_dim, # Model dimension d_model
+                d_state=d_state,  # SSM state expansion factor
+                d_conv=d_conv,    # Local convolution width
+                expand=expand,    # Block expansion factor
+        )
+        self.proj = nn.Linear(input_dim, output_dim)
+        
+        self.skip_scale= nn.Parameter(torch.ones(1))
+        self.mlp = shiftmlp(in_features=input_dim)
+
+        
+        self.Conv = nn.Sequential(
+            nn.Conv2d(input_dim//4, input_dim//4, 3, stride=1, padding=1),
+        )
+    
+    def forward(self, x):
+        if x.dtype == torch.float16:
+            x = x.type(torch.float32)
+        B, C = x.shape[:2]
+        _, _,H,W = x.shape
+        assert C == self.input_dim
+        n_tokens = x.shape[2:].numel()
+        img_dims = x.shape[2:]
+        x_flat = x.reshape(B, C, n_tokens).transpose(-1, -2)
+        x_norm = self.norm(x_flat)
+        
+        x_mamba = self.mamba(x_norm) + self.mlp(x_norm,H,W) + self.skip_scale * x_norm
+        
+        x_mamba = self.norm(x_mamba)
+        x_mamba = self.proj(x_mamba)
+        out = x_mamba.transpose(-1, -2).reshape(B, self.output_dim, *img_dims)
+        return out
    
 
 
